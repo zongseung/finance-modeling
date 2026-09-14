@@ -44,6 +44,7 @@ def load() -> dict:
         "cal": pl.read_csv(MODEL / "calibration.csv", schema_overrides=S),
         "cov": pl.read_csv(MODEL / "coverage_curve.csv", schema_overrides=S),
         "sens": pl.read_csv(MODEL / "sensitivity.csv", schema_overrides=S),
+        "lam_sens": pl.read_csv(MODEL / "lambda_sensitivity.csv", schema_overrides=S),
         "pilot_sens": pl.read_csv(MODEL / "pilot_sensitivity.csv", schema_overrides=S),
         "oc": pl.read_csv(MODEL / "operating_characteristics.csv", schema_overrides=S),
         "bias": pl.read_csv(MODEL / "share_bias_check.csv", schema_overrides=S),
@@ -189,6 +190,16 @@ def build(d: dict) -> str:
     def retro_row(o, p):
         return retro.filter((pl.col("outcome") == o) & (pl.col("predictor") == p)).row(0, named=True)
 
+    def supply_clause(lam5_row, lam20_row):
+        """공급만 대비 구간(delta_vs_supply)을 λ=5·20 각각 표시. q05<=0이면 "0을 포함", 아니면 "0보다 큼"."""
+        w5 = "0을 포함합니다" if lam5_row["delta_vs_supply_q05"] <= 0 else "0보다 큽니다"
+        w20 = "0을 포함합니다" if lam20_row["delta_vs_supply_q05"] <= 0 else "0보다 큽니다"
+        d5 = f"[{lam5_row['delta_vs_supply_q05']:+.3f}, {lam5_row['delta_vs_supply_q95']:+.3f}]"
+        d20 = f"[{lam20_row['delta_vs_supply_q05']:+.3f}, {lam20_row['delta_vs_supply_q95']:+.3f}]"
+        if w5 == w20:
+            return f"λ=5 {d5}, λ=20 {d20}로 둘 다 {w5}"
+        return f"λ=5 {d5}로 {w5}, λ=20 {d20}로 {w20}"
+
     surv = retro_row("survival_1y", "R_rel")
     surv_per = {b: surv[f"rho_{b}"] for b in ORDER}
     best_b = max(ORDER, key=lambda b: surv_per[b])
@@ -229,6 +240,11 @@ def build(d: dict) -> str:
     cal_rows = [[KOR[r["b"]], pct(r["censored_share"]), pct(r["pred_P_le_upper"]), pct(r["cover50"], 0), pct(r["cover80"], 0), pct(r["cover90"], 0), pct(r["cover95"], 0)]
                 for r in cal.iter_rows(named=True)]
     sens_rows = [[KOR[b], f"{sens[b]['spearman']:.2f}", f"{sens[b]['jaccard_top25']:.2f}", f"{sens[b]['jaccard_fdr_set']:.2f}"] for b in ("H", "8006", "8021", "4020")]
+    lam_sens = d["lam_sens"]
+    lam_sp_lo, lam_sp_hi = lam_sens["spearman"].min(), lam_sens["spearman"].max()
+    lam_jf_lo, lam_jf_hi = lam_sens["jaccard_fdr_set"].min(), lam_sens["jaccard_fdr_set"].max()
+    surv_lam5, surv_lam20 = retro_row("survival_1y", "R_rel_lam5"), retro_row("survival_1y", "R_rel_lam20")
+    nts_lam5, nts_lam20 = retro_row("nts_net_growth", "R_rel_lam5"), retro_row("nts_net_growth", "R_rel_lam20")
     oc_rows = [[label, f"{pct(ocr[k]['f0'])} ~ {pct(ocr[k]['f1'])}", f"{pct(ocr[k]['t0'])} ~ {pct(ocr[k]['t1'])}"]
                for k, label in (("credo_fdr", "CREDO FDR 목록"), ("rrel_topn", "R̃ 사후평균 상위 n"), ("naive_G_rel", "점포당 수요 G (지역 안 비교)"), ("naive_G", "점포당 수요 G"))]
     pick_txt = " → ".join(f"{r['CCG_NM']}({pct(r['cover_share_mean'], 0)})" for r in h_picks.iter_rows(named=True))
@@ -340,7 +356,7 @@ u·v = 지역·지역×업종 효과(합-0 제약). 16만 셀을 GPU(numpyro) NU
 <li><b>진입률</b>은 어느 기간에서도 예측하지 못했습니다. CREDO는 진입 예측기가 아닙니다.</li>
 <li><b>신규 점포 1년 생존</b>은 수요 기간과 생존 기간이 겹쳐 시간 순서가 맞는 유일한 검증입니다.
 CREDO R̃만 구간이 0보다 크고 경쟁만 보는 기준보다도 유의하게 높습니다(가장 강한 업종: {KOR[best_b]} ρ {surv_per[best_b]:+.2f}). 효과 크기는 작으므로 "생존 관점의 위험 선별"로 제시합니다.
-층 2 모형(포아송 + 목적형 상권수요)은 이 점검 전에 이론 근거로 정했습니다.</li>
+층 2 모형(포아송 + 목적형 상권수요)은 이 생존 점검 전에 정했습니다. 국세청 순증으로 변형을 비교한 뒤였지만 점수 1위가 아니라 계수 자료·공간 가정(결정 9)과의 일관성으로 골랐고, 지역 절반 분할 200회 탐색 점검(국세청 순증 기준)에서 점수로 고른 변형과 표본 밖 차이가 확인되지 않았습니다(−0.002, 90% 구간 −0.029 ~ +0.016).</li>
 </ul>
 <h3>5.3 판단 규칙의 운영특성 (같은 목록 크기, 사후분포 참값 기준)</h3>
 {tbl(["규칙", "오탐률", "적중률"], oc_rows, right={1, 2}, width="80%")}
@@ -350,7 +366,10 @@ CREDO R̃만 구간이 0보다 크고 경쟁만 보는 기준보다도 유의하
 <p>국세청 업종 대응을 넓혀도(한식 + 기타음식점, 서양 + 패스트푸드·커피 등) 한식·스넥은 안정적이고, 서양음식·슈퍼마켓은 해석에 주의가 필요합니다.
 4주 검증 후보는 팝업 관측오차 가정을 1/4배~4배로 바꿔도 겹침 {ps.min():.2f}~{ps.max():.2f}입니다.
 고령 BC카드 보유자 구성 편향 점검에서는 계수 κ = {bias_row['kappa']:+.2f} (결합 90% 구간 {bias_row['lo']:+.2f} ~ {bias_row['hi']:+.2f})로 가설 방향의 연관이 있지만
-설명력이 {pct(bias_row['r2'])}로 작습니다(기준 5%). 이 연관을 제거해도 업종별 상위 25% 목록 겹침은 {d['bias']['jaccard_top25_sensitivity'].min():.2f}~{d['bias']['jaccard_top25_sensitivity'].max():.2f}로 대부분 유지됩니다.</p>
+설명력이 {pct(bias_row['r2'])}로 작습니다(기준 5%). 이 연관을 제거해도 업종별 상위 25% 목록 겹침은 {d['bias']['jaccard_top25_sensitivity'].min():.2f}~{d['bias']['jaccard_top25_sensitivity'].max():.2f}로 대부분 유지됩니다.
+층 2 상권수요 λ를 5·20km로 바꿔도 목적형 4업종 순위상관 {lam_sp_lo:.2f}~{lam_sp_hi:.2f}, 개설 목록 겹침 {lam_jf_lo:.2f}~{lam_jf_hi:.2f}로 안정적입니다.
+신규 점포 생존 ρ도 λ=5 {surv_lam5['mean_rho']:+.3f} [{surv_lam5['rho_q05']:+.3f}, {surv_lam5['rho_q95']:+.3f}], λ=20 {surv_lam20['mean_rho']:+.3f} [{surv_lam20['rho_q05']:+.3f}, {surv_lam20['rho_q95']:+.3f}]로 주 분석(λ=10km)과 비슷하며, 공급만 대비 구간은 {supply_clause(surv_lam5, surv_lam20)}.
+국세청 순증 기준 공급만 대비 구간은 {supply_clause(nts_lam5, nts_lam20)}.</p>
 
 <h2>6. 서비스 설계</h2>
 <h3>6.1 예비창업자 화면</h3>
@@ -393,7 +412,7 @@ CREDO R̃만 구간이 0보다 크고 경쟁만 보는 기준보다도 유의하
     ["합-0 centered 효과 + GPU NUTS", "non-centered는 R-hat 1.07로 실패"],
     ["지역 고정 공변량은 층 2로", "층 1에서는 지역효과와 식별 불가(샘플러 궤적 2배)"],
     ["근린형은 자기 지역, 목적형은 10km 감쇠", "편의점 상권은 시군구보다 작음"],
-    ["층 2 포아송 + 목적형 상권수요 (이론으로 사전 확정)", "계수 자료·결정 9와 일관, 생존 사후 점검으로 확인"],
+    ["층 2 포아송 + 목적형 상권수요 (생존 점검 전 확정)", "계수 자료·결정 9와 일관, 분할 표본에서 점수 선택안과 표본 밖 차이 미확인"],
 ])}
 <h3>B. 데이터 출처</h3>
 <p class="note">BC카드 AI금융빅데이터플랫폼 공모전 제공 데이터(재배포 금지) · 행정안전부 주민등록 인구통계(jumin.mois.go.kr) · 공공데이터포털: 국세청 100대 생활업종(15061118),

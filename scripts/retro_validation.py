@@ -3,7 +3,8 @@
 예측변수 (모두 지역 안 업종 상대값, 기준 공급 S₀ = 국세청 1년 전 2025-06 사업자 수, D = 층 1 사후평균):
 - supply_only : −log(S₀+1)                       (수요 정보 없음, 평균회귀·경쟁 효과 기준선)
 - naive_G     : log D − log(S₀+1)                 (점포당 수요)
-- R_rel       : decide.market_room (결정 10: 포아송 + 목적형 상권수요), β̂ 점추정
+- R_rel       : decide.market_room (결정 10: 포아송 + 목적형 상권수요, λ=10km), β̂ 점추정
+- R_rel_lam5, R_rel_lam20 : R_rel과 같음, λ=5·20km (층 2 λ 민감도)
 
 결과변수:
 1. nts_net_growth : 국세청 1년 순증 log(S₁+1) − log(S₀+1). S₀를 예측변수와 공유해 평균회귀가 섞이므로
@@ -27,7 +28,7 @@ import numpy as np
 import polars as pl
 from scipy import stats
 
-from decide import EXT, KEY, NEAR, ROOT, covariates, distance_km, market_room, supply
+from decide import EXT, KEY, LAMBDAS, NEAR, ROOT, covariates, distance_km, market_room, supply
 from fetch_external import RAW, query_map, to_regions
 
 # 결정 3의 국세청 대응과 같은 범위의 상가정보 분류
@@ -112,10 +113,12 @@ def main() -> None:
     s0 = supply(regions, industries, False, "NTS_YEAR_AGO_COUNT")
     s1 = supply(regions, industries, False, "NTS_CURRENT_COUNT")
     dest = np.array([b not in NEAR for b in industries])
+    w, dist = covariates(regions), distance_km(regions)  # 한 번만 계산, R_rel·R_rel_lam5·R_rel_lam20이 공유
     predictors = {
         "supply_only": rel(-np.log1p(s0)),
         "naive_G": rel(log_d - np.log1p(s0)),
-        "R_rel": rel(market_room(log_d[None], s0, covariates(regions), distance_km(regions), dest, rng=None)[0]),
+        "R_rel": rel(market_room(log_d[None], s0, w, dist, dest, rng=None)[0]),
+        **{f"R_rel_lam{int(lam)}": rel(market_room(log_d[None], s0, w, dist, dest, rng=None, lam=lam)[0]) for lam in LAMBDAS[1:]},
     }
 
     stores = {d: load_stores(d, regions) for d in DATES}
