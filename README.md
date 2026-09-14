@@ -4,7 +4,7 @@
 
 - 대회: BC카드 제1회 AI금융빅데이터플랫폼 소비데이터 활용 분석·아이디어 공모전 (제출 마감 2026-09-22)
 - 분석 단위: 2026년 1~6월 × 전국 255개 시군구 × 성·연령 12개 집단 × 9개 업종(수요) / 8개 업종(결정)
-- 상세 방법론: [`claudedocs/methodology_credo_model.md`](claudedocs/methodology_credo_model.md)
+- 상세 방법론: 이 문서의 [4. 방법론](#4-방법론)과 [10. 의사결정 로그](#10-의사결정-로그)
 
 > **데이터 보안 안내:** 공모전 원자료(`ABP_CONTEST_DATA.csv`)는 대회 보안서약에 따라 이 저장소에 포함하지 않습니다. 참가자는 공모전 플랫폼에서 받아 저장소 루트에 두어야 합니다. 토큰과 인증키(`.env*`)도 커밋되지 않습니다.
 
@@ -199,9 +199,7 @@ finance-modeling/
 │   ├── external/raw/        # 원본 (커밋 제외)
 │   ├── external/processed/  # 전처리 결과 (커밋)
 │   └── model/               # 적합·결정 산출물 (커밋 제외, 재생성)
-├── claudedocs/              # 방법론 문서, 조사 보고서
-├── reports/                 # 초기 기획서 초안
-└── docs/superpowers/plans/  # 구현 계획
+└── reports/                 # 초기 기획서 초안
 ```
 
 ---
