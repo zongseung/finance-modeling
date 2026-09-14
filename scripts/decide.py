@@ -25,6 +25,7 @@ NEAR = {"4010", "4020", "8301", "8021"}  # 결정 9: 근린형(편의점·슈퍼
 LAMBDAS = (10.0, 5.0, 20.0)  # 목적형 거리 감쇠 λ km (주, 민감도)
 PILOTS = 10  # 업종당 4주 검증 예산
 LAMBDA_SCALES = (1.0, 0.25, 4.0)  # 지식 기울기 λ(팝업 관측오차) scale (주, 민감도)
+SEED = 20260914  # λ 민감도가 주 분석과 같은 시드(같은 난수열)를 써서 차이가 λ에서만 오게 한다
 
 
 def supply(regions: pl.DataFrame, industries, broad: bool, col: str = "NTS_CURRENT_COUNT") -> np.ndarray:
@@ -190,7 +191,7 @@ def main() -> None:
     assert bool(z["passed"]) or args.allow_unconverged, "층 1 진단 실패본: 층 2·3에 사용 금지"
     log_d, industries = z["log_demand"].astype(float), list(z["industries"])
     regions = pl.DataFrame([r.split("|") for r in z["regions"]], schema=KEY, orient="row")
-    rng = np.random.default_rng(20260914)
+    rng = np.random.default_rng(SEED)
     w, dist = covariates(regions), distance_km(regions)
     dest = np.array([b not in NEAR for b in industries])
 
@@ -246,7 +247,7 @@ def main() -> None:
 
     lam_sens = []  # 상권수요 λ 민감도(목적형 업종만): 주 분석(λ=10) 대비, 주 공급으로 λ마다 새 rng
     for lam in LAMBDAS[1:]:
-        R_lam = market_room(log_d, supply(regions, industries, False), w, dist, dest, np.random.default_rng(20260914), lam=lam)
+        R_lam = market_room(log_d, supply(regions, industries, False), w, dist, dest, np.random.default_rng(SEED), lam=lam)
         R_rel_lam = R_lam - R_lam.mean(2, keepdims=True)
         d_lam = decide(R_rel_lam)
         for b, name in enumerate(industries):
