@@ -31,16 +31,16 @@ def supply(regions: pl.DataFrame, industries, broad: bool) -> np.ndarray:
     for n, b in enumerate(industries):
         names = SUPPLY[b] + (BROAD.get(b, []) if broad else [])
         s = nts.filter(pl.col("NTS_INDUSTRY").is_in(names)).group_by(KEY).agg(pl.col("NTS_CURRENT_COUNT").sum())
-        out[:, n] = regions.join(s, on=KEY, how="left")["NTS_CURRENT_COUNT"].fill_null(0).to_numpy()  # 행 없음 = 사업자 0
+        out[:, n] = regions.join(s, on=KEY, how="left", maintain_order="left")["NTS_CURRENT_COUNT"].fill_null(0).to_numpy()  # 행 없음 = 사업자 0
     return out
 
 
 def covariates(regions: pl.DataFrame) -> np.ndarray:
     """결정 8: 지역 고정 공변량은 층 2의 w_i (아파트 ㎡가, 국민연금 가입자, 평균 외지인·외국인 방문자)."""
     w = (
-        regions.join(pl.read_csv(EXT / "apt_price_sgg_2026h1.csv").select(*KEY, "MEDIAN_PRICE_PER_M2_10K_KRW"), on=KEY, how="left")
-        .join(pl.read_csv(EXT / "workers_sgg_202607.csv").select(*KEY, "NPS_WORKERS"), on=KEY, how="left")
-        .join(pl.read_csv(EXT / "visitors_sgg_month_2026h1.csv").group_by(KEY).agg(pl.col("OUTSIDE_VISITORS", "FOREIGN_VISITORS").mean()), on=KEY, how="left")
+        regions.join(pl.read_csv(EXT / "apt_price_sgg_2026h1.csv").select(*KEY, "MEDIAN_PRICE_PER_M2_10K_KRW"), on=KEY, how="left", maintain_order="left")
+        .join(pl.read_csv(EXT / "workers_sgg_202607.csv").select(*KEY, "NPS_WORKERS"), on=KEY, how="left", maintain_order="left")
+        .join(pl.read_csv(EXT / "visitors_sgg_month_2026h1.csv").group_by(KEY).agg(pl.col("OUTSIDE_VISITORS", "FOREIGN_VISITORS").mean()), on=KEY, how="left", maintain_order="left")
         .with_columns(pl.col("MEDIAN_PRICE_PER_M2_10K_KRW").fill_null(pl.col("MEDIAN_PRICE_PER_M2_10K_KRW").median().over("SIDO_NM")))  # 옹진
         .select(pl.all().exclude(KEY).log())
         .to_numpy()
@@ -96,7 +96,7 @@ def pilot_set(nu: np.ndarray, in_set: np.ndarray) -> np.ndarray:
 
 
 def distance_km(regions: pl.DataFrame) -> np.ndarray:
-    c = regions.join(pl.read_csv(EXT / "sgg_centroids_202606.csv").select(*KEY, "LON", "LAT"), on=KEY, how="left")
+    c = regions.join(pl.read_csv(EXT / "sgg_centroids_202606.csv").select(*KEY, "LON", "LAT"), on=KEY, how="left", maintain_order="left")
     lat, lon = np.radians(c["LAT"].to_numpy()), np.radians(c["LON"].to_numpy())
     h = np.sin((lat[:, None] - lat) / 2) ** 2 + np.cos(lat[:, None]) * np.cos(lat) * np.sin((lon[:, None] - lon) / 2) ** 2
     return 12742 * np.arcsin(np.sqrt(h))
@@ -158,11 +158,16 @@ def main() -> None:
 
     R, R_rel, d = results["main"]
     mu, sd = R_rel.mean(0), R_rel.std(0)  # (255, 8) 사후평균·표준편차, 지식 기울기 입력
-    lam = np.array([LAMBDA_SCALES[0] * np.median(sd[:, b] ** 2) for b in range(len(industries))])
-    nu = np.column_stack([kg_value(mu[:, b], sd[:, b], d["r_gamma"][b], lam[b]) for b in range(len(industries))])
+    # scale별 λ(팝업 관측오차 분산 근사)·ν·검증 후보 집합을 한 번씩만 계산 (주 분석 scale=1.0 재사용, 수식 중복 제거)
+    kg_lam = {scale: np.array([scale * np.median(sd[:, b] ** 2) for b in range(len(industries))]) for scale in LAMBDA_SCALES}
+    nu_by_scale = {scale: np.column_stack([kg_value(mu[:, b], sd[:, b], d["r_gamma"][b], kg_lam[scale][b])
+                                            for b in range(len(industries))]) for scale in LAMBDA_SCALES}
+    pilot_idx_by_scale = {scale: [pilot_set(nu_by_scale[scale][:, b], d["in_set"][:, b]) for b in range(len(industries))]
+                           for scale in LAMBDA_SCALES}
+    nu = nu_by_scale[LAMBDA_SCALES[0]]
     pilot = np.zeros_like(d["in_set"])
     for b in range(len(industries)):
-        pilot[pilot_set(nu[:, b], d["in_set"][:, b]), b] = True
+        pilot[pilot_idx_by_scale[LAMBDA_SCALES[0]][b], b] = True
     action = np.where(d["in_set"], "immediate", np.where(pilot, "pilot", "hold"))
 
     rows = []
@@ -178,10 +183,9 @@ def main() -> None:
 
     pilot_sens = []  # 검증 후보 집합의 λ 민감도: scale 0.25 / 4.0 vs 주 분석(scale 1.0)
     for b, name in enumerate(industries):
-        main_set = set(np.nonzero(pilot[:, b])[0].tolist())
+        main_set = set(pilot_idx_by_scale[LAMBDA_SCALES[0]][b].tolist())
         for scale in LAMBDA_SCALES[1:]:
-            nu_s = kg_value(mu[:, b], sd[:, b], d["r_gamma"][b], scale * np.median(sd[:, b] ** 2))
-            alt_set = set(pilot_set(nu_s, d["in_set"][:, b]).tolist())
+            alt_set = set(pilot_idx_by_scale[scale][b].tolist())
             pilot_sens.append((name, scale, len(main_set & alt_set) / max(len(main_set | alt_set), 1)))
     pl.DataFrame(pilot_sens, schema=["b", "lambda_scale", "jaccard_vs_main"], orient="row").write_csv(out / "pilot_sensitivity.csv")
 
