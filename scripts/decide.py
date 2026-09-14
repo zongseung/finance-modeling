@@ -2,7 +2,7 @@
 층 2(결정 10): 사업자 수 포아송 회귀, 목적형 업종(한식·중식·일식·서양)은 거리 감쇠 상권수요(λ=10km).
 
 실행: uv run python scripts/decide.py            (data/model/log_demand.npz 필요, 층 1 진단 통과본만)
-산출: data/model/decision_table.csv, sensitivity.csv, coverage_curve.csv, pilot_sensitivity.csv, r_rel_draws.npz
+산출: data/model/decision_table.csv, sensitivity.csv, coverage_curve.csv, pilot_sensitivity.csv, r_rel_draws.npz, lambda_sensitivity.csv
 """
 
 import argparse
@@ -52,9 +52,9 @@ def covariates(regions: pl.DataFrame) -> np.ndarray:
     return (w - w.mean(0)) / w.std(0)
 
 
-def catchment(log_d: np.ndarray, dist: np.ndarray, dest: np.ndarray) -> np.ndarray:
-    """결정 10: 목적형 업종 수요는 상권수요 log Σ_j exp(−d_ij/λ) D_j (λ=LAMBDAS[0]), 근린형은 자기 지역. log_d (I, B)."""
-    shared = logsumexp(-dist[:, :, None] / LAMBDAS[0] + log_d[None, :, :], axis=1)
+def catchment(log_d: np.ndarray, dist: np.ndarray, dest: np.ndarray, lam: float = LAMBDAS[0]) -> np.ndarray:
+    """결정 10: 목적형 업종 수요는 상권수요 log Σ_j exp(−d_ij/λ) D_j (λ 기본 LAMBDAS[0], 민감도는 인자로 교체), 근린형은 자기 지역. log_d (I, B)."""
+    shared = logsumexp(-dist[:, :, None] / lam + log_d[None, :, :], axis=1)
     return np.where(dest, shared, log_d)
 
 
@@ -74,14 +74,14 @@ def poisson_fit(X: np.ndarray, s: np.ndarray, beta: np.ndarray | None = None) ->
     return beta, phi * np.linalg.inv(X.T @ (mu[:, None] * X))
 
 
-def market_room(log_d: np.ndarray, s: np.ndarray, w: np.ndarray, dist: np.ndarray, dest: np.ndarray, rng) -> np.ndarray:
-    """결정 10: draw·업종마다 log E[S] = a + ψ·log D(목적형은 상권수요) + w·ρ 포아송 회귀.
+def market_room(log_d: np.ndarray, s: np.ndarray, w: np.ndarray, dist: np.ndarray, dest: np.ndarray, rng, lam: float = LAMBDAS[0]) -> np.ndarray:
+    """결정 10: draw·업종마다 log E[S] = a + ψ·log D(목적형은 상권수요, λ 기본 LAMBDAS[0]) + w·ρ 포아송 회귀.
     β는 근사 사후분포에서 한 번 추출(rng=None이면 β̂ 점추정). R = Xβ − log(S+0.5). shape (draws, I, B)."""
     S, I, B = log_d.shape
     R = np.empty_like(log_d)
     warm = [None] * B  # 이전 draw 해로 IRLS 시작
     for t in range(S):
-        eff = catchment(log_d[t], dist, dest)
+        eff = catchment(log_d[t], dist, dest, lam)
         for b in range(B):
             X = np.column_stack([np.ones(I), eff[:, b], w])
             warm[b], cov = poisson_fit(X, s[:, b], warm[b])
@@ -102,6 +102,13 @@ def decide(R_rel: np.ndarray) -> dict:
         in_set[order[:n_keep], b] = True
     ranks = (-R_rel).argsort(1).argsort(1) + 1  # draw별 업종 내 순위
     return {"v": v, "in_set": in_set, "rank_lo": np.quantile(ranks, 0.05, 0), "rank_hi": np.quantile(ranks, 0.95, 0), "r_gamma": r_gamma}
+
+
+def overlap_metrics(m: np.ndarray, m_alt: np.ndarray, in_set: np.ndarray, in_set_alt: np.ndarray) -> tuple[float, float, float]:
+    """주 분석 대비 대안(넓은 공급 정의 또는 다른 λ)의 사후평균 R̃ 일치도: Spearman, 상위 25% Jaccard, FDR 즉시 목록 Jaccard."""
+    top = lambda x: set(np.argsort(-x)[: len(x) // 4])
+    return (stats.spearmanr(m, m_alt).statistic, len(top(m) & top(m_alt)) / len(top(m) | top(m_alt)),
+            (in_set & in_set_alt).sum() / max((in_set | in_set_alt).sum(), 1))
 
 
 def kg_value(mu: np.ndarray, sd: np.ndarray, threshold, lam) -> np.ndarray:
@@ -160,6 +167,10 @@ def selftest() -> None:
     far = np.full((3, 3), 1e6) - np.diag(np.full(3, 1e6))  # 서로 멀면 상권수요 = 자기 수요
     ld = rng.normal(size=(3, 2))
     assert np.allclose(catchment(ld, far, np.array([True, False])), ld)
+    mid = np.array([[0, 10, 40], [10, 0, 40], [40, 40, 0]], float)  # 중간 거리: λ 5 vs 20이 값을 바꾸는 규모
+    c5, c20 = catchment(ld, mid, np.array([True, False]), lam=5.0), catchment(ld, mid, np.array([True, False]), lam=20.0)
+    assert not np.allclose(c5[:, 0], c20[:, 0])  # 목적형 열: λ가 실제로 쓰인다
+    assert np.allclose(c5[:, 1], c20[:, 1])  # 근린형 열: λ와 무관(자기 수요 그대로)
 
     with np.errstate(all="raise"):  # 0 나눔 등 경고를 에러로 승격해 검증
         assert kg_value(0.0, 0.0, 5.0, 1.0) == 0.0  # sd=0 → ν=0
@@ -230,12 +241,22 @@ def main() -> None:
     for b, name in enumerate(industries):
         if name not in BROAD:
             continue
-        top = lambda x: set(np.argsort(-x)[: len(x) // 4])
-        m, mb = R_rel[:, :, b].mean(0), Rb_rel[:, :, b].mean(0)
-        a, c = d["in_set"][:, b], db["in_set"][:, b]
-        sens.append((name, stats.spearmanr(m, mb).statistic, len(top(m) & top(mb)) / len(top(m) | top(mb)),
-                     (a & c).sum() / max((a | c).sum(), 1)))
+        sens.append((name, *overlap_metrics(R_rel[:, :, b].mean(0), Rb_rel[:, :, b].mean(0), d["in_set"][:, b], db["in_set"][:, b])))
     pl.DataFrame(sens, schema=["b", "spearman", "jaccard_top25", "jaccard_fdr_set"], orient="row").write_csv(out / "sensitivity.csv")
+
+    lam_sens = []  # 상권수요 λ 민감도(목적형 업종만): 주 분석(λ=10) 대비, 주 공급으로 λ마다 새 rng
+    for lam in LAMBDAS[1:]:
+        R_lam = market_room(log_d, supply(regions, industries, False), w, dist, dest, np.random.default_rng(20260914), lam=lam)
+        R_rel_lam = R_lam - R_lam.mean(2, keepdims=True)
+        d_lam = decide(R_rel_lam)
+        for b, name in enumerate(industries):
+            if not dest[b]:
+                continue
+            spearman, jt25, jfdr = overlap_metrics(R_rel[:, :, b].mean(0), R_rel_lam[:, :, b].mean(0), d["in_set"][:, b], d_lam["in_set"][:, b])
+            lam_sens.append((name, lam, spearman, jt25, jfdr, int(d_lam["in_set"][:, b].sum())))
+    lam_df = pl.DataFrame(lam_sens, schema=["b", "lambda_km", "spearman", "jaccard_top25", "jaccard_fdr_set", "n_immediate"], orient="row")
+    lam_df.write_csv(out / "lambda_sensitivity.csv")
+
     D, curves = dist, []
     for b, name in enumerate(industries):
         room = np.maximum(R_rel[:, :, b], 0)
@@ -248,6 +269,7 @@ def main() -> None:
     print(table.group_by("b").agg(pl.col("immediate_fdr10").sum().alias("n_immediate")).sort("b"))
     print(curve.filter(pl.col("lambda_km").is_in([0.0, 10.0]) & pl.col("K").is_in([5, 10, 20])).select("b", "K", "cover_share_mean", "cover_share_q05", "cover_share_q95").sort("b", "K"))
     print(pl.read_csv(out / "sensitivity.csv"))
+    print(lam_df)
     print(table.group_by("b").agg((pl.col("action") == "immediate").sum().alias("immediate"),
                                    (pl.col("action") == "pilot").sum().alias("pilot"),
                                    (pl.col("action") == "hold").sum().alias("hold")).sort("b"))
