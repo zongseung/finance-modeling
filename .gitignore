@@ -15,3 +15,4 @@ im-not-ai/
 # 내부 작업 문서 (저장소 제외)
 claudedocs/
 docs/
+reports/*.html
