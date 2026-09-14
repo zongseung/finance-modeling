@@ -342,12 +342,12 @@ uv run python -c "import jax; print(jax.devices())"
 ---
 
 ## 12. 팀
-| GitHub |
-|---|
-| [@zongseung](https://github.com/zongseung) |
-| [@wnddnr0914](https://github.com/wnddnr0914) |
-| [@rahyeon9978-wq](https://github.com/rahyeon9978-wq) |
-| [@millet-birb](https://github.com/millet-birb) |
+| GitHub | 역할 |
+|---|---|
+| [@zongseung](https://github.com/zongseung) | Supervisor |
+| [@wnddnr0914](https://github.com/wnddnr0914) | 모델링 구축 |
+| [@rahyeon9978-wq](https://github.com/rahyeon9978-wq) | Data pipeline processing |
+| [@millet-birb](https://github.com/millet-birb) | EDA and Data Collection pipeline |
 
 ---
 
