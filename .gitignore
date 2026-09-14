@@ -1,5 +1,6 @@
 # 비밀·대회 원자료(보안서약)·대용량·재생성 산출물
 .env
+.env*
 ABP_CONTEST_DATA.csv
 .venv/
 __pycache__/
