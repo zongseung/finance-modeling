@@ -1,7 +1,7 @@
 """층 2·3: 시장 여유 R → 상대 시장 여유 R̃ → 사후기대 FDR 즉시 목록 (methodology_credo_model.md 4~5절).
 
 실행: uv run python scripts/decide.py            (data/model/log_demand.npz 필요, 층 1 진단 통과본만)
-산출: data/model/decision_table.csv, sensitivity.csv, coverage_curve.csv
+산출: data/model/decision_table.csv, sensitivity.csv, coverage_curve.csv, pilot_sensitivity.csv, r_rel_draws.npz
 """
 
 import argparse
@@ -21,6 +21,8 @@ BROAD = {"H": ["기타음식점"], "8006": ["패스트푸드점", "커피음료�
 GAMMA, ALPHA = 0.75, 0.10  # 상위 25% 기준, 사후기대 FDR 목표
 NEAR = {"4010", "4020", "8301", "8021"}  # 결정 9: 근린형(편의점·슈퍼·제과·스넥)은 자기 지역만 커버
 LAMBDAS = (10.0, 5.0, 20.0)  # 목적형 거리 감쇠 λ km (주, 민감도)
+PILOTS = 10  # 업종당 4주 검증 예산
+LAMBDA_SCALES = (1.0, 0.25, 4.0)  # 지식 기울기 λ(팝업 관측오차) scale (주, 민감도)
 
 
 def supply(regions: pl.DataFrame, industries, broad: bool) -> np.ndarray:
@@ -77,6 +79,22 @@ def decide(R_rel: np.ndarray) -> dict:
     return {"v": v, "in_set": in_set, "rank_lo": np.quantile(ranks, 0.05, 0), "rank_hi": np.quantile(ranks, 0.95, 0), "r_gamma": r_gamma}
 
 
+def kg_value(mu: np.ndarray, sd: np.ndarray, threshold, lam) -> np.ndarray:
+    """지식 기울기 ν (Frazier–Powell–Dayanik 2008, 5.3절): 4주 검증 한 곳의 기대 정보가치. sd=0이면 ν=0."""
+    var = sd ** 2
+    tilde = var / np.sqrt(var + lam)
+    denom = np.where(sd == 0, 1.0, tilde)  # 0 나눔 회피 (sd=0인 자리는 tilde=0이라 아래서 결국 0)
+    z = -np.abs(mu - threshold) / denom
+    nu = tilde * (z * stats.norm.cdf(z) + stats.norm.pdf(z))
+    return np.where(sd == 0, 0.0, nu)
+
+
+def pilot_set(nu: np.ndarray, in_set: np.ndarray) -> np.ndarray:
+    """즉시 목록 밖에서 ν>0인 지역 중 ν 상위 PILOTS개 인덱스."""
+    cand = np.where(~in_set & (nu > 0))[0]
+    return cand[np.argsort(-nu[cand])[:PILOTS]]
+
+
 def distance_km(regions: pl.DataFrame) -> np.ndarray:
     c = regions.join(pl.read_csv(EXT / "sgg_centroids_202606.csv").select(*KEY, "LON", "LAT"), on=KEY, how="left")
     lat, lon = np.radians(c["LAT"].to_numpy()), np.radians(c["LON"].to_numpy())
@@ -111,6 +129,13 @@ def selftest() -> None:
     fdr = (1 - d["v"][d["in_set"][:, 0], 0]).mean()
     assert fdr <= ALPHA + 1e-9
 
+    with np.errstate(all="raise"):  # 0 나눔 등 경고를 에러로 승격해 검증
+        assert kg_value(0.0, 0.0, 5.0, 1.0) == 0.0  # sd=0 → ν=0
+        close, far = kg_value(0.0, 0.5, 0.1, 1.0), kg_value(0.0, 0.5, 3.0, 1.0)
+        assert close > far > 0, (close, far)  # 같은 sd에서 threshold에 가까울수록 ν가 크다
+        small_sd, big_sd = kg_value(0.0, 0.5, 2.0, 1.0), kg_value(0.0, 2.0, 2.0, 1.0)
+        assert big_sd > small_sd > 0, (small_sd, big_sd)  # 같은 |mu-threshold|에서 sd가 클수록 ν가 크다
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -132,15 +157,36 @@ def main() -> None:
         results[label] = (R, R_rel, decide(R_rel))
 
     R, R_rel, d = results["main"]
+    mu, sd = R_rel.mean(0), R_rel.std(0)  # (255, 8) 사후평균·표준편차, 지식 기울기 입력
+    lam = np.array([LAMBDA_SCALES[0] * np.median(sd[:, b] ** 2) for b in range(len(industries))])
+    nu = np.column_stack([kg_value(mu[:, b], sd[:, b], d["r_gamma"][b], lam[b]) for b in range(len(industries))])
+    pilot = np.zeros_like(d["in_set"])
+    for b in range(len(industries)):
+        pilot[pilot_set(nu[:, b], d["in_set"][:, b]), b] = True
+    action = np.where(d["in_set"], "immediate", np.where(pilot, "pilot", "hold"))
+
     rows = []
     for i, (sido, ccg) in enumerate(regions.iter_rows()):
         for b, name in enumerate(industries):
             rows.append((sido, ccg, name, R_rel[:, i, b].mean(), *np.quantile(R_rel[:, i, b], [0.05, 0.95]), d["v"][i, b],
-                         bool(d["in_set"][i, b]), d["rank_lo"][i, b], d["rank_hi"][i, b], R[:, i, b].mean()))
+                         bool(d["in_set"][i, b]), d["rank_lo"][i, b], d["rank_hi"][i, b], R[:, i, b].mean(),
+                         float(nu[i, b]), str(action[i, b])))
     table = pl.DataFrame(rows, schema=[*KEY, "b", "R_rel_mean", "R_rel_q05", "R_rel_q95", "v_top25", "immediate_fdr10",
-                                       "rank_q05", "rank_q95", "R_abs_mean_reference"], orient="row")
+                                       "rank_q05", "rank_q95", "R_abs_mean_reference", "kg_value", "action"], orient="row")
     out = args.demand.parent
     table.sort("b", "v_top25", descending=[False, True]).write_csv(out / "decision_table.csv")
+
+    pilot_sens = []  # 검증 후보 집합의 λ 민감도: scale 0.25 / 4.0 vs 주 분석(scale 1.0)
+    for b, name in enumerate(industries):
+        main_set = set(np.nonzero(pilot[:, b])[0].tolist())
+        for scale in LAMBDA_SCALES[1:]:
+            nu_s = kg_value(mu[:, b], sd[:, b], d["r_gamma"][b], scale * np.median(sd[:, b] ** 2))
+            alt_set = set(pilot_set(nu_s, d["in_set"][:, b]).tolist())
+            pilot_sens.append((name, scale, len(main_set & alt_set) / max(len(main_set | alt_set), 1)))
+    pl.DataFrame(pilot_sens, schema=["b", "lambda_scale", "jaccard_vs_main"], orient="row").write_csv(out / "pilot_sensitivity.csv")
+
+    np.savez(out / "r_rel_draws.npz", R_rel=R_rel.astype(np.float32), regions=z["regions"], industries=z["industries"],
+              in_set=d["in_set"], v=d["v"], r_gamma=d["r_gamma"])
 
     _, Rb_rel, db = results["broad"]
     sens = []
@@ -165,6 +211,9 @@ def main() -> None:
     print(table.group_by("b").agg(pl.col("immediate_fdr10").sum().alias("n_immediate")).sort("b"))
     print(curve.filter(pl.col("lambda_km").is_in([0.0, 10.0]) & pl.col("K").is_in([5, 10, 20])).select("b", "K", "cover_share_mean", "cover_share_q05", "cover_share_q95").sort("b", "K"))
     print(pl.read_csv(out / "sensitivity.csv"))
+    print(table.group_by("b").agg((pl.col("action") == "immediate").sum().alias("immediate"),
+                                   (pl.col("action") == "pilot").sum().alias("pilot"),
+                                   (pl.col("action") == "hold").sum().alias("hold")).sort("b"))
 
 
 if __name__ == "__main__":
