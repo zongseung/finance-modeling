@@ -1,4 +1,5 @@
-"""층 2·3: 시장 여유 R → 상대 시장 여유 R̃ → 사후기대 FDR 즉시 목록 (methodology_credo_model.md 4~5절).
+"""층 2·3: 시장 여유 R → 상대 시장 여유 R̃ → 사후기대 FDR 즉시 목록, 지식 기울기, 공간 커버리지.
+층 2(결정 10): 사업자 수 포아송 회귀, 목적형 업종(한식·중식·일식·서양)은 거리 감쇠 상권수요(λ=10km).
 
 실행: uv run python scripts/decide.py            (data/model/log_demand.npz 필요, 층 1 진단 통과본만)
 산출: data/model/decision_table.csv, sensitivity.csv, coverage_curve.csv, pilot_sensitivity.csv, r_rel_draws.npz
@@ -10,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 from scipy import stats
+from scipy.special import logsumexp
 
 ROOT = Path(__file__).resolve().parents[1]
 EXT = ROOT / "data" / "external" / "processed"
@@ -25,13 +27,14 @@ PILOTS = 10  # 업종당 4주 검증 예산
 LAMBDA_SCALES = (1.0, 0.25, 4.0)  # 지식 기울기 λ(팝업 관측오차) scale (주, 민감도)
 
 
-def supply(regions: pl.DataFrame, industries, broad: bool) -> np.ndarray:
+def supply(regions: pl.DataFrame, industries, broad: bool, col: str = "NTS_CURRENT_COUNT") -> np.ndarray:
+    """국세청 사업자 수 (255, B). col: NTS_CURRENT_COUNT(2026-06) 또는 NTS_YEAR_AGO_COUNT(2025-06)."""
     nts = pl.read_csv(EXT / "nts_100_living_industries_sgg_202606.csv")
     out = np.zeros((regions.height, len(industries)))
     for n, b in enumerate(industries):
         names = SUPPLY[b] + (BROAD.get(b, []) if broad else [])
-        s = nts.filter(pl.col("NTS_INDUSTRY").is_in(names)).group_by(KEY).agg(pl.col("NTS_CURRENT_COUNT").sum())
-        out[:, n] = regions.join(s, on=KEY, how="left", maintain_order="left")["NTS_CURRENT_COUNT"].fill_null(0).to_numpy()  # 행 없음 = 사업자 0
+        s = nts.filter(pl.col("NTS_INDUSTRY").is_in(names)).group_by(KEY).agg(pl.col(col).sum())
+        out[:, n] = regions.join(s, on=KEY, how="left", maintain_order="left")[col].fill_null(0).to_numpy()  # 행 없음 = 사업자 0
     return out
 
 
@@ -49,19 +52,41 @@ def covariates(regions: pl.DataFrame) -> np.ndarray:
     return (w - w.mean(0)) / w.std(0)
 
 
-def market_room(log_d: np.ndarray, log_s: np.ndarray, w: np.ndarray, rng) -> np.ndarray:
-    """draw·업종마다 log S ~ 1 + log D + w 를 평탄 사전분포 켤레 회귀로 한 번 추출. R = 적합값 − log S. shape (S, I, B)."""
+def catchment(log_d: np.ndarray, dist: np.ndarray, dest: np.ndarray) -> np.ndarray:
+    """결정 10: 목적형 업종 수요는 상권수요 log Σ_j exp(−d_ij/λ) D_j (λ=LAMBDAS[0]), 근린형은 자기 지역. log_d (I, B)."""
+    shared = logsumexp(-dist[:, :, None] / LAMBDAS[0] + log_d[None, :, :], axis=1)
+    return np.where(dest, shared, log_d)
+
+
+def poisson_fit(X: np.ndarray, s: np.ndarray, beta: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """log E[S] = Xβ 포아송 회귀 IRLS. 반환: β̂, 근사 사후공분산 φ·(XᵀWX)⁻¹.
+    점포 수는 과산포라 피어슨 산포 φ = Σ(S−μ)²/μ / (n−p) (≥1)로 공분산을 키운다(준포아송)."""
+    if beta is None:
+        beta = np.linalg.lstsq(X, np.log(s + 0.5), rcond=None)[0]
+    for _ in range(100):
+        mu = np.exp(X @ beta)
+        step = np.linalg.solve(X.T @ (mu[:, None] * X), X.T @ (s - mu))
+        beta = beta + step
+        if np.abs(step).max() < 1e-10:
+            break
+    mu = np.exp(X @ beta)
+    phi = max(((s - mu) ** 2 / mu).sum() / (len(s) - X.shape[1]), 1.0)
+    return beta, phi * np.linalg.inv(X.T @ (mu[:, None] * X))
+
+
+def market_room(log_d: np.ndarray, s: np.ndarray, w: np.ndarray, dist: np.ndarray, dest: np.ndarray, rng) -> np.ndarray:
+    """결정 10: draw·업종마다 log E[S] = a + ψ·log D(목적형은 상권수요) + w·ρ 포아송 회귀.
+    β는 근사 사후분포에서 한 번 추출(rng=None이면 β̂ 점추정). R = Xβ − log(S+0.5). shape (draws, I, B)."""
     S, I, B = log_d.shape
     R = np.empty_like(log_d)
-    for s in range(S):
+    warm = [None] * B  # 이전 draw 해로 IRLS 시작
+    for t in range(S):
+        eff = catchment(log_d[t], dist, dest)
         for b in range(B):
-            X = np.column_stack([np.ones(I), log_d[s, :, b], w])
-            y = log_s[:, b]
-            beta_hat, rss, *_ = np.linalg.lstsq(X, y, rcond=None)
-            dof = I - X.shape[1]
-            sigma2 = float(rss[0]) / rng.chisquare(dof)
-            beta = rng.multivariate_normal(beta_hat, sigma2 * np.linalg.inv(X.T @ X))
-            R[s, :, b] = X @ beta - y
+            X = np.column_stack([np.ones(I), eff[:, b], w])
+            warm[b], cov = poisson_fit(X, s[:, b], warm[b])
+            beta = warm[b] if rng is None else rng.multivariate_normal(warm[b], cov)
+            R[t, :, b] = X @ beta - np.log(s[:, b] + 0.5)
     return R
 
 
@@ -129,6 +154,13 @@ def selftest() -> None:
     fdr = (1 - d["v"][d["in_set"][:, 0], 0]).mean()
     assert fdr <= ALPHA + 1e-9
 
+    X = np.column_stack([np.ones(255), rng.normal(size=(255, 2))])  # 포아송 회귀 계수 복원
+    beta_hat, cov = poisson_fit(X, rng.poisson(np.exp(X @ np.array([1.5, 0.8, -0.3]))).astype(float))
+    assert np.allclose(beta_hat, [1.5, 0.8, -0.3], atol=0.1) and np.all(np.diag(cov) > 0), beta_hat
+    far = np.full((3, 3), 1e6) - np.diag(np.full(3, 1e6))  # 서로 멀면 상권수요 = 자기 수요
+    ld = rng.normal(size=(3, 2))
+    assert np.allclose(catchment(ld, far, np.array([True, False])), ld)
+
     with np.errstate(all="raise"):  # 0 나눔 등 경고를 에러로 승격해 검증
         assert kg_value(0.0, 0.0, 5.0, 1.0) == 0.0  # sd=0 → ν=0
         close, far = kg_value(0.0, 0.5, 0.1, 1.0), kg_value(0.0, 0.5, 3.0, 1.0)
@@ -148,11 +180,12 @@ def main() -> None:
     log_d, industries = z["log_demand"].astype(float), list(z["industries"])
     regions = pl.DataFrame([r.split("|") for r in z["regions"]], schema=KEY, orient="row")
     rng = np.random.default_rng(20260914)
-    w = covariates(regions)
+    w, dist = covariates(regions), distance_km(regions)
+    dest = np.array([b not in NEAR for b in industries])
 
     results = {}
     for label, broad in (("main", False), ("broad", True)):
-        R = market_room(log_d, np.log1p(supply(regions, industries, broad)), w, rng)
+        R = market_room(log_d, supply(regions, industries, broad), w, dist, dest, rng)
         R_rel = R - R.mean(2, keepdims=True)  # 결정 4: 지역 안 업종 간 비교
         results[label] = (R, R_rel, decide(R_rel))
 
@@ -203,7 +236,7 @@ def main() -> None:
         sens.append((name, stats.spearmanr(m, mb).statistic, len(top(m) & top(mb)) / len(top(m) | top(mb)),
                      (a & c).sum() / max((a | c).sum(), 1)))
     pl.DataFrame(sens, schema=["b", "spearman", "jaccard_top25", "jaccard_fdr_set"], orient="row").write_csv(out / "sensitivity.csv")
-    D, curves = distance_km(regions), []
+    D, curves = dist, []
     for b, name in enumerate(industries):
         room = np.maximum(R_rel[:, :, b], 0)
         for lam in (0.0,) if name in NEAR else LAMBDAS:
