@@ -1,0 +1,13 @@
+# 비밀·대회 원자료(보안서약)·대용량·재생성 산출물
+.env
+ABP_CONTEST_DATA.csv
+.venv/
+__pycache__/
+data/external/raw/
+data/model/
+.codegraph
+.superpowers/
+# 다른 세션 작업 폴더
+_workspace/
+ELI5/
+im-not-ai/
