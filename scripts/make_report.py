@@ -44,6 +44,7 @@ def load() -> dict:
         "cal": pl.read_csv(MODEL / "calibration.csv", schema_overrides=S),
         "cov": pl.read_csv(MODEL / "coverage_curve.csv", schema_overrides=S),
         "sens": pl.read_csv(MODEL / "sensitivity.csv", schema_overrides=S),
+        "lam_sens": pl.read_csv(MODEL / "lambda_sensitivity.csv", schema_overrides=S),
         "pilot_sens": pl.read_csv(MODEL / "pilot_sensitivity.csv", schema_overrides=S),
         "oc": pl.read_csv(MODEL / "operating_characteristics.csv", schema_overrides=S),
         "bias": pl.read_csv(MODEL / "share_bias_check.csv", schema_overrides=S),
@@ -229,6 +230,10 @@ def build(d: dict) -> str:
     cal_rows = [[KOR[r["b"]], pct(r["censored_share"]), pct(r["pred_P_le_upper"]), pct(r["cover50"], 0), pct(r["cover80"], 0), pct(r["cover90"], 0), pct(r["cover95"], 0)]
                 for r in cal.iter_rows(named=True)]
     sens_rows = [[KOR[b], f"{sens[b]['spearman']:.2f}", f"{sens[b]['jaccard_top25']:.2f}", f"{sens[b]['jaccard_fdr_set']:.2f}"] for b in ("H", "8006", "8021", "4020")]
+    lam_sens = d["lam_sens"]
+    lam_sp_lo, lam_sp_hi = lam_sens["spearman"].min(), lam_sens["spearman"].max()
+    lam_jf_lo, lam_jf_hi = lam_sens["jaccard_fdr_set"].min(), lam_sens["jaccard_fdr_set"].max()
+    surv_lam5, surv_lam20 = retro_row("survival_1y", "R_rel_lam5"), retro_row("survival_1y", "R_rel_lam20")
     oc_rows = [[label, f"{pct(ocr[k]['f0'])} ~ {pct(ocr[k]['f1'])}", f"{pct(ocr[k]['t0'])} ~ {pct(ocr[k]['t1'])}"]
                for k, label in (("credo_fdr", "CREDO FDR 목록"), ("rrel_topn", "R̃ 사후평균 상위 n"), ("naive_G_rel", "점포당 수요 G (지역 안 비교)"), ("naive_G", "점포당 수요 G"))]
     pick_txt = " → ".join(f"{r['CCG_NM']}({pct(r['cover_share_mean'], 0)})" for r in h_picks.iter_rows(named=True))
@@ -350,7 +355,9 @@ CREDO R̃만 구간이 0보다 크고 경쟁만 보는 기준보다도 유의하
 <p>국세청 업종 대응을 넓혀도(한식 + 기타음식점, 서양 + 패스트푸드·커피 등) 한식·스넥은 안정적이고, 서양음식·슈퍼마켓은 해석에 주의가 필요합니다.
 4주 검증 후보는 팝업 관측오차 가정을 1/4배~4배로 바꿔도 겹침 {ps.min():.2f}~{ps.max():.2f}입니다.
 고령 BC카드 보유자 구성 편향 점검에서는 계수 κ = {bias_row['kappa']:+.2f} (결합 90% 구간 {bias_row['lo']:+.2f} ~ {bias_row['hi']:+.2f})로 가설 방향의 연관이 있지만
-설명력이 {pct(bias_row['r2'])}로 작습니다(기준 5%). 이 연관을 제거해도 업종별 상위 25% 목록 겹침은 {d['bias']['jaccard_top25_sensitivity'].min():.2f}~{d['bias']['jaccard_top25_sensitivity'].max():.2f}로 대부분 유지됩니다.</p>
+설명력이 {pct(bias_row['r2'])}로 작습니다(기준 5%). 이 연관을 제거해도 업종별 상위 25% 목록 겹침은 {d['bias']['jaccard_top25_sensitivity'].min():.2f}~{d['bias']['jaccard_top25_sensitivity'].max():.2f}로 대부분 유지됩니다.
+층 2 상권수요 λ를 5·20km로 바꿔도 목적형 4업종 순위상관 {lam_sp_lo:.2f}~{lam_sp_hi:.2f}, 개설 목록 겹침 {lam_jf_lo:.2f}~{lam_jf_hi:.2f}로 안정적입니다.
+신규 점포 생존 ρ도 λ=5 {surv_lam5['mean_rho']:+.3f} [{surv_lam5['rho_q05']:+.3f}, {surv_lam5['rho_q95']:+.3f}], λ=20 {surv_lam20['mean_rho']:+.3f} [{surv_lam20['rho_q05']:+.3f}, {surv_lam20['rho_q95']:+.3f}]로 주 분석(λ=10km)과 비슷하며, 공급만 대비 구간은 두 λ 모두 0보다 큽니다.</p>
 
 <h2>6. 서비스 설계</h2>
 <h3>6.1 예비창업자 화면</h3>
